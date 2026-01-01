@@ -2,6 +2,7 @@ import random
 from battlecode25.stubs import *
 
 # Globals
+# Globals
 directions = [
     Direction.NORTH,
     Direction.NORTHEAST,
@@ -13,8 +14,20 @@ directions = [
     Direction.NORTHWEST,
 ]
 
+SPAWN_LOC = None
+MAP_CENTER = None
+
 def turn():
+    global SPAWN_LOC, MAP_CENTER
     try:
+        if SPAWN_LOC is None:
+            SPAWN_LOC = get_location()
+            
+        if MAP_CENTER is None:
+            w = get_map_width()
+            h = get_map_height()
+            MAP_CENTER = MapLocation(w//2, h//2)
+            
         my_type = get_type()
         if my_type == UnitType.SOLDIER:
             run_soldier()
@@ -26,6 +39,90 @@ def turn():
             run_tower()
     except Exception as e:
         log(f"Error in turn: {e}")
+
+# ... (omitted) ...
+
+def try_mark_structure(my_loc):
+    # 1. Check for Unmarked Ruins (Tower)
+    nearby_map_infos = sense_nearby_map_infos()
+    
+    # SAFE RUIN STRATEGY:
+    # Prioritize ruins that are CLOSEST TO SPAWN (Safe Area), even if they are behind us.
+    # Logic: Score = Distance(Me, Ruin) + Weight * Distance(Spawn, Ruin)
+    # Raising Weight makes us prefer "Safe" ruins more.
+    
+    best_ruin = None
+    best_score = 999999
+    
+    for info in nearby_map_infos:
+        if info.has_ruin():
+            # Check if occupied by friend
+            loc = info.get_map_location()
+            robot = sense_robot_at_location(loc)
+            if robot and robot.get_team() == get_team(): continue
+            
+            # Check if already marked (Handled by try_paint_project)
+            if info.get_mark() != PaintType.EMPTY: continue
+            
+            # Helper: Approximate spawn location logic (Global SPAWN_LOC)
+            dist_me = my_loc.distance_squared_to(loc)
+            dist_spawn = 0
+            if SPAWN_LOC:
+                dist_spawn = SPAWN_LOC.distance_squared_to(loc)
+            
+            # Weighted Score: Minimize specific score
+            # A low score is good.
+            # We want LOW dist_spawn (Safe) to be very important.
+            score = dist_me + (1.5 * dist_spawn)
+            
+            if score < best_score:
+                best_score = score
+                best_ruin = info
+
+    if best_ruin:
+        ruin_loc = best_ruin.get_map_location()
+        if my_loc.distance_squared_to(ruin_loc) <= 2:
+            tower_type = UnitType.LEVEL_ONE_PAINT_TOWER
+            if can_mark_tower_pattern(tower_type, ruin_loc):
+                mark_tower_pattern(tower_type, ruin_loc)
+                log("Marked Tower (Safe Priority)!")
+                return True
+        else:
+            navigate_bounce(ruin_loc)
+            return True
+
+    # 2. Start SRP (If safe) - Using Symmetry to check safety
+    if is_safe_for_srp(my_loc):
+        start_srp_loc = None
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                check_loc = my_loc.translate(dx, dy)
+                if can_mark_resource_pattern(check_loc):
+                    start_srp_loc = check_loc
+                    break
+            if start_srp_loc: break
+            
+        if start_srp_loc:
+            mark_resource_pattern(start_srp_loc)
+            log("Marked SRP!")
+            return True
+        
+    return False
+
+def is_safe_for_srp(my_loc):
+    # Use Symmetry to guess enemy direction
+    # If we are closer to SPAWN than Map Center, we are relatively safe.
+    if SPAWN_LOC and MAP_CENTER:
+        dist_spawn = my_loc.distance_squared_to(SPAWN_LOC)
+        dist_center = my_loc.distance_squared_to(MAP_CENTER)
+        
+        # If closer to Spawn than Center, we are in "Home Territory"
+        if dist_spawn < dist_center:
+            return True
+            
+    # Fallback to local check
+    nearby_enemies = sense_nearby_robots(team=get_team().opponent())
+    return len(nearby_enemies) == 0
 
 # --- TOWER ---
 def run_tower():
@@ -145,12 +242,32 @@ def run_soldier():
     # 4. Expansion Actions (Marking)
     if try_mark_structure(my_loc): return
     
+    # 4.5 Explore Safe Area (Early Game / New Units)
+    # Check if we should explore "behind" us first.
+    if should_explore_safe_area(my_loc):
+        if explore_safe_area(my_loc): return
+        
     # 5. Explore / Paint Ground
     if try_paint_ground(my_loc): return
     
     navigate_randomly()
 
 # --- BEHAVIORS ---
+
+def should_explore_safe_area(my_loc):
+    # If round is early (< 100), force check towards Spawn
+    if get_round_num() < 300:
+        if SPAWN_LOC:
+            dist = my_loc.distance_squared_to(SPAWN_LOC)
+            if dist > 30: # If we wandered too far, check back
+                return True
+    return False
+
+def explore_safe_area(my_loc):
+    if SPAWN_LOC:
+        navigate_bounce(SPAWN_LOC)
+        return True
+    return False
 
 def try_complete_structure(my_loc):
     # 1. Check for Towers at Ruins
@@ -228,56 +345,10 @@ def try_combat(my_loc):
         return True
     return False
 
-def try_mark_structure(my_loc):
-    # 1. Check for Unmarked Ruins (Tower)
-    nearby_map_infos = sense_nearby_map_infos()
-    closest_ruin = None
-    min_dist = 999
-    
-    for info in nearby_map_infos:
-        if info.has_ruin():
-            # Check if occupied by friend
-            loc = info.get_map_location()
-            robot = sense_robot_at_location(loc)
-            if robot and robot.get_team() == get_team(): continue
-            
-            # Check if already marked (Handled by try_paint_project, so we only care about UNMARKED here)
-            if info.get_mark() != PaintType.EMPTY: continue
-            
-            dist = my_loc.distance_squared_to(loc)
-            if dist < min_dist:
-                min_dist = dist
-                closest_ruin = info
-
-    if closest_ruin:
-        ruin_loc = closest_ruin.get_map_location()
-        if my_loc.distance_squared_to(ruin_loc) <= 2:
-            tower_type = UnitType.LEVEL_ONE_PAINT_TOWER
-            if can_mark_tower_pattern(tower_type, ruin_loc):
-                mark_tower_pattern(tower_type, ruin_loc)
-                log("Marked Tower!")
-                return True
-        else:
-            navigate_bounce(ruin_loc)
-            return True
-
-    # 2. Start SRP (If safe)
-    # Simple check: Scan nearby 5x5 area
-    start_srp_loc = None
-    for dx in range(-2, 3):
-        for dy in range(-2, 3):
-            check_loc = my_loc.translate(dx, dy)
-            if can_mark_resource_pattern(check_loc):
-                start_srp_loc = check_loc
-                break
-        if start_srp_loc: break
-        
-    if start_srp_loc:
-        mark_resource_pattern(start_srp_loc)
-        log("Marked SRP!")
-        return True
-        
     return False
+
+# (Old function removed/replaced by keying on function signature)
+
 
 def try_paint_ground(my_loc):
     # Endgame Frenzy
