@@ -33,7 +33,7 @@ def turn():
     elif get_type() == UnitType.MOPPER:
         run_mopper()
     elif get_type() == UnitType.SPLASHER:
-        pass  # TODO
+        run_splasher()
     elif get_type().is_tower_type():
         run_tower()
     else:
@@ -41,22 +41,45 @@ def turn():
 
 
 def run_tower():
-    # Pick a direction to build in.
-    dir = directions[random.randint(0, len(directions) - 1)]
-    next_loc = get_location().add(dir)
+    nearby_enemies = sense_nearby_robots(team=get_team().opponent())
+    nearby_allies = sense_nearby_robots(team=get_team())
 
-    # Pick a random robot type to build.
-    robot_type = random.randint(0, 2)
-    if robot_type == 0 and can_build_robot(UnitType.SOLDIER, next_loc):
-        build_robot(UnitType.SOLDIER, next_loc)
-        log("BUILT A SOLDIER")
-    if robot_type == 1 and can_build_robot(UnitType.MOPPER, next_loc):
-        build_robot(UnitType.MOPPER, next_loc)
-        log("BUILT A MOPPER")
-    if robot_type == 2 and can_build_robot(UnitType.SPLASHER, next_loc):
-        set_indicator_string("SPLASHER NOT IMPLEMENTED YET");
-        #build_robot(RobotType.SPLASHER, next_loc)
-        #log("BUILT A SPLASHER")
+    # Count nearby allies to balance production.
+    soldier_count = 0
+    mopper_count = 0
+    splasher_count = 0
+    for ally in nearby_allies:
+        ally_type = ally.get_type()
+        if ally_type == UnitType.SOLDIER:
+            soldier_count = soldier_count + 1
+        elif ally_type == UnitType.MOPPER:
+            mopper_count = mopper_count + 1
+        elif ally_type == UnitType.SPLASHER:
+            splasher_count = splasher_count + 1
+
+    # Decide what to spawn.
+    spawn_type = UnitType.SOLDIER
+    if len(nearby_enemies) > 0:
+        # Close defense: prefer Mopper, otherwise Soldier.
+        spawn_type = UnitType.MOPPER
+    else:
+        # Balanced growth: keep soldiers highest, splashers behind.
+        if soldier_count < mopper_count + 1:
+            spawn_type = UnitType.SOLDIER
+        elif splasher_count * 2 < soldier_count:
+            spawn_type = UnitType.SPLASHER
+        else:
+            spawn_type = UnitType.SOLDIER
+
+    # Try to build in a valid direction.
+    build_dirs = list(directions)
+    random.shuffle(build_dirs)
+    for dir in build_dirs:
+        next_loc = get_location().add(dir)
+        if can_build_robot(spawn_type, next_loc):
+            build_robot(spawn_type, next_loc)
+            log("BUILT A " + str(spawn_type))
+            break
 
     # Read incoming messages
     messages = read_messages()
@@ -152,6 +175,60 @@ def run_mopper():
     # We can also move our code into different methods or classes to better organize it!
     update_enemy_robots()
 
+
+def run_splasher():
+    # Prefer attacking clusters, otherwise paint/expand.
+    nearby_enemies = sense_nearby_robots(team=get_team().opponent())
+    if len(nearby_enemies) >= 2:
+        best_loc = None
+        best_hits = 0
+        for enemy in nearby_enemies:
+            center = enemy.get_location()
+            hits = 0
+            for other in nearby_enemies:
+                if other.get_location().distance_squared_to(center) <= 2:
+                    hits = hits + 1
+            if hits > best_hits and can_attack(center):
+                best_hits = hits
+                best_loc = center
+        if best_loc is not None and best_hits >= 2:
+            attack(best_loc)
+            return
+
+    # Single target attack if possible.
+    if len(nearby_enemies) > 0:
+        target = nearby_enemies[0].get_location()
+        if can_attack(target):
+            attack(target)
+            return
+
+    # Paint beneath us if needed.
+    my_loc = get_location()
+    current_tile = sense_map_info(my_loc)
+    if not current_tile.get_paint().is_ally() and can_attack(my_loc):
+        attack(my_loc)
+        return
+
+    # Paint adjacent tiles, preferring enemy paint.
+    best_paint_target = None
+    for dir in directions:
+        target_loc = my_loc.add(dir)
+        if can_attack(target_loc):
+            paint = sense_map_info(target_loc).get_paint()
+            if paint.is_enemy():
+                best_paint_target = target_loc
+                break
+            if paint == PaintType.EMPTY and best_paint_target is None:
+                best_paint_target = target_loc
+
+    if best_paint_target is not None:
+        attack(best_paint_target)
+        return
+
+    # Move to expand territory.
+    dir = directions[random.randint(0, len(directions) - 1)]
+    if can_move(dir):
+        move(dir)
 
 def update_enemy_robots():
     # Sensing methods can be passed in a radius of -1 to automatically 

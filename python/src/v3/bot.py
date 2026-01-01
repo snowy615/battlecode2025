@@ -43,224 +43,322 @@ def run_tower():
     round_num = get_round_num()
     money = get_money()
     
-    # Economy Safety: Don't spend if we are poor!
-    # Reserve some chips for Paint Towers (Expansion)
-    # Defense Towers are luxury items.
+    # DYNAMIC ECONOMY
+    # Early Game: Swarm (0 Buffer). Late Game: Build Towers (1000 Buffer).
+    if round_num < 400:
+        MIN_CHIPS = 0
+    else:
+        MIN_CHIPS = 1000 
     
-    MIN_CHIPS_FOR_UNIT = 200 
     MIN_CHIPS_FOR_DEFENSE = 1000
+    RICH_THRESHOLD = 2000
     
-    # If enemies are nearby, PANIC SPEND (ignore limits)
     under_threat = len(nearby_enemies) > 0
     
     if not under_threat:
-        if money < MIN_CHIPS_FOR_UNIT:
-            return # Save money
+        if money < MIN_CHIPS:
+            return 
+ 
             
-    # Ratios (Adjusted for Defense)
-    prob_soldier = 0.8
-    prob_mopper = 0.1
-    prob_money = 0.05
-    prob_defense = 0.0 
+    # Ratios
+    # Favor Splashers (AoE) over Moppers for combat survival
+    prob_soldier = 0.75
+    prob_mopper = 0.05
+    # prob_splasher = remainder (~0.20)
+    
+    prob_money = 0.0
+    prob_defense = 0.0
     
     if round_num > 400:
-        prob_soldier = 0.65 
-        prob_mopper = 0.2
+        prob_soldier = 0.65
+        prob_mopper = 0.10
         prob_money = 0.0
-        prob_defense = 0.10 
+        prob_defense = 0.10
     
+    if money > RICH_THRESHOLD:
+        prob_defense = 0.50
+        
     spawn_dir = directions[random.randint(0, len(directions) - 1)]
     spawn_loc = my_location.add(spawn_dir)
     
-    # Check Special Towers
     roll = random.random()
     
-    # Defense Tower (Mid/Late Game) - Only if rich!
-    if roll < prob_defense and round_num > 400:
+    # Defense Tower
+    if (round_num > 400 and roll < prob_defense) or (money > RICH_THRESHOLD and roll < 0.5):
         if money > MIN_CHIPS_FOR_DEFENSE or under_threat:
              if can_build_robot(UnitType.LEVEL_ONE_DEFENSE_TOWER, spawn_loc):
                 build_robot(UnitType.LEVEL_ONE_DEFENSE_TOWER, spawn_loc)
                 return
 
-    # Money Tower (Early Game)
-    if roll < prob_money and round_num < 200:
+    # Money Tower
+    if roll < prob_money and round_num < 200 and money < RICH_THRESHOLD:
         if can_build_robot(UnitType.LEVEL_ONE_MONEY_TOWER, spawn_loc):
              build_robot(UnitType.LEVEL_ONE_MONEY_TOWER, spawn_loc)
              return
 
-    # Standard Units (Re-roll for standard distribution)
+    # Standard Units
     roll = random.random()
-    if roll < prob_soldier:
+    
+    limit_soldier = prob_soldier
+    limit_mopper = limit_soldier + prob_mopper
+    
+    if roll < limit_soldier: 
         if can_build_robot(UnitType.SOLDIER, spawn_loc):
             build_robot(UnitType.SOLDIER, spawn_loc)
-    elif roll < prob_soldier + prob_mopper:
+            return
+    elif roll < limit_mopper:
         if can_build_robot(UnitType.MOPPER, spawn_loc):
             build_robot(UnitType.MOPPER, spawn_loc)
+            return
     else:
+        # Splasher
         if can_build_robot(UnitType.SPLASHER, spawn_loc):
             build_robot(UnitType.SPLASHER, spawn_loc)
+            return
+
+    # Final Fallback to Soldier if Splasher failed
+    if can_build_robot(UnitType.SOLDIER, spawn_loc):
+         build_robot(UnitType.SOLDIER, spawn_loc)
 
 # --- SOLDIER ---
 def run_soldier():
+    """
+    Behavior Tree Structure:
+    1. Try Complete Tower/SRP (Critical Economy)
+    2. Try Paint Project (Working on existing Marks)
+    3. Try Combat (Survival/Offense)
+    4. Try Mark Tower/SRP (Expansion)
+    5. Explore/Paint
+    """
     my_loc = get_location()
+    
+    # 1. Critical Actions
+    if try_complete_structure(my_loc): return
 
-    # 1. Combat & Kiting
+    # 2. Paint Projects (Existing Marks)
+    # This MUST be higher priority than Marking to prevent infinite loops.
+    if try_paint_project(my_loc): return
+
+    # 3. Combat
+    if try_combat(my_loc): return
+    
+    # 4. Expansion Actions (Marking)
+    if try_mark_structure(my_loc): return
+    
+    # 5. Explore / Paint Ground
+    if try_paint_ground(my_loc): return
+    
+    navigate_randomly()
+
+# --- BEHAVIORS ---
+
+def try_complete_structure(my_loc):
+    # 1. Check for Towers at Ruins
+    nearby_map_infos = sense_nearby_map_infos()
+    for info in nearby_map_infos:
+        if info.has_ruin():
+            ruin_loc = info.get_map_location()
+            tower_type = UnitType.LEVEL_ONE_PAINT_TOWER
+            
+            if can_complete_tower_pattern(tower_type, ruin_loc):
+                complete_tower_pattern(tower_type, ruin_loc)
+                log("Completed Tower!")
+                return True
+                
+    # 2. Check for SRPs (Immediate Vicinity)
+    if can_complete_resource_pattern(my_loc):
+        complete_resource_pattern(my_loc)
+        log("Completed SRP!")
+        return True
+        
+    for d in directions:
+        adj = my_loc.add(d)
+        if can_complete_resource_pattern(adj):
+            complete_resource_pattern(adj)
+            log("Completed SRP!")
+            return True
+            
+    return False
+
+def try_paint_project(my_loc):
+    # Scan for tiles that are MARKED but need painting.
+    nearby_map_infos = sense_nearby_map_infos()
+    
+    best_project = None
+    best_dist = 999
+    
+    for info in nearby_map_infos:
+        mark = info.get_mark()
+        # If marked and not empty, it's a project.
+        if mark != PaintType.EMPTY:
+            # Check if paint matches mark (simple check: if paint != mark)
+            # Actually, we need to correct it.
+            paint = info.get_paint()
+            if paint != mark:
+                dist = my_loc.distance_squared_to(info.get_map_location())
+                if dist < best_dist:
+                    best_dist = dist
+                    best_project = info.get_map_location()
+    
+    if best_project:
+        if can_attack(best_project):
+            # Determine needed paint type
+            target_info = sense_map_info(best_project)
+            needed_mark = target_info.get_mark()
+            use_secondary = (needed_mark == PaintType.ALLY_SECONDARY)
+            attack(best_project, use_secondary)
+            return True
+        else:
+            # Move towards it
+            navigate_bounce(best_project)
+            return True
+            
+    return False
+
+def try_combat(my_loc):
     nearby_enemies = sense_nearby_robots(team=get_team().opponent())
     if nearby_enemies:
         target = nearby_enemies[0]
-        dist_sq = my_loc.distance_squared_to(target.get_location())
-        
-        # Kiting Logic (Refined)
-        # Optimal Range: 13-20 (Attack Range is 20)
-        # If too close (<10), retreat.
-        # If in effective range (10-20), stand and fight.
-        # If too far (>20), approach.
-        
-        # Priority: Attack if possible
-        has_attacked = False
         if can_attack(target.get_location()):
             attack(target.get_location())
-            has_attacked = True
         
-        # Movement logic (independent of attack if cooldowns separate)
-        # Assuming move and attack share some cooldown resource (paint/action)?
-        # If we attacked, can we move? 
-        # Check `can_move` handles cooldowns.
-        
-        should_retreat = (dist_sq < 10) or (get_health() < 20) # Retreat if low hp
-        
-        if should_retreat:
-             # Retreat towards nearest friendly tower if exists, else away from enemy
-             dir_away = target.get_location().direction_to(my_loc)
-             if can_move(dir_away):
-                 move(dir_away)
-             else:
-                 # Try side step
-                 navigate_bounce(my_loc.add(dir_away))
-        elif dist_sq > 20:
-             # Pursue
+        dist_sq = my_loc.distance_squared_to(target.get_location())
+        if dist_sq > 2:
              navigate_bounce(target.get_location())
-        else:
-             # In sweet spot. Hold ground or jiggle?
-             # If we haven't attacked (e.g. out of range slightly?), move closer
-             if not has_attacked and dist_sq > 16:
-                 navigate_bounce(target.get_location())
-        
-        return # Combat focus
+        return True
+    return False
 
-    # 2. Economy Projects
+def try_mark_structure(my_loc):
+    # 1. Check for Unmarked Ruins (Tower)
     nearby_map_infos = sense_nearby_map_infos()
-    
-    if can_complete_resource_pattern(my_loc):
-        complete_resource_pattern(my_loc)
-        return
-    for d in directions:
-        if can_complete_resource_pattern(my_loc.add(d)):
-             complete_resource_pattern(my_loc.add(d))
-             return
-
-    srp_project_loc = None
-    for tile in nearby_map_infos:
-        if tile.get_map_location().distance_squared_to(my_loc) <= 8:
-            mark = tile.get_mark()
-            paint = tile.get_paint()
-            if mark != PaintType.EMPTY and mark != paint:
-                srp_project_loc = tile.get_map_location()
-                break
-    
-    if srp_project_loc:
-        if can_attack(srp_project_loc):
-             target_tile = sense_map_info(srp_project_loc)
-             use_secondary = (target_tile.get_mark() == PaintType.ALLY_SECONDARY)
-             attack(srp_project_loc, use_secondary)
-             return
-        else:
-            navigate_bounce(srp_project_loc)
-            return
-
-    # 3. Ruins
     closest_ruin = None
-    min_dist = 99999
+    min_dist = 999
     
     for info in nearby_map_infos:
         if info.has_ruin():
+            # Check if occupied by friend
             loc = info.get_map_location()
-            robot_on_ruin = sense_robot_at_location(loc)
-            if robot_on_ruin and robot_on_ruin.get_team() == get_team() and robot_on_ruin.get_type().is_tower_type():
-                continue
-                
+            robot = sense_robot_at_location(loc)
+            if robot and robot.get_team() == get_team(): continue
+            
+            # Check if already marked (Handled by try_paint_project, so we only care about UNMARKED here)
+            if info.get_mark() != PaintType.EMPTY: continue
+            
             dist = my_loc.distance_squared_to(loc)
             if dist < min_dist:
                 min_dist = dist
                 closest_ruin = info
-            
+
     if closest_ruin:
         ruin_loc = closest_ruin.get_map_location()
-        dist = min_dist
-
-        if dist <= 2: 
+        if my_loc.distance_squared_to(ruin_loc) <= 2:
             tower_type = UnitType.LEVEL_ONE_PAINT_TOWER
-            # Late game Defense Towers are built by run_tower spawning, 
-            # here soldiers build base Paint/Money towers on ruins?
-            # Or should soldiers build Defense Towers?
-            # Soldiers build the tower initially. 
-            # Let's say if we are consistently losing, we build Defense.
-            # For now, keep Paint Tower as default expansion. 
-            # Defense towers are upgraded? No, distinct types.
-            # Let's add a small chance for Soldier to build Defense Tower if deep in game?
-            # Or stick to Paint Tower for expansion (Radius is key).
-            
             if can_mark_tower_pattern(tower_type, ruin_loc):
                 mark_tower_pattern(tower_type, ruin_loc)
-            if can_complete_tower_pattern(tower_type, ruin_loc):
-                complete_tower_pattern(tower_type, ruin_loc)
-                return
+                log("Marked Tower!")
+                return True
         else:
             navigate_bounce(ruin_loc)
-            return
+            return True
 
-    # 4. New SRP
-    best_srp_loc = None
+    # 2. Start SRP (If safe)
+    # Simple check: Scan nearby 5x5 area
+    start_srp_loc = None
     for dx in range(-2, 3):
         for dy in range(-2, 3):
             check_loc = my_loc.translate(dx, dy)
             if can_mark_resource_pattern(check_loc):
-                best_srp_loc = check_loc
+                start_srp_loc = check_loc
                 break
-        if best_srp_loc: break
+        if start_srp_loc: break
         
-    if best_srp_loc:
-        mark_resource_pattern(best_srp_loc)
-        return
+    if start_srp_loc:
+        mark_resource_pattern(start_srp_loc)
+        log("Marked SRP!")
+        return True
+        
+    return False
 
-    # 5. Paint Ground
-    cur_tile = sense_map_info(my_loc)
-    if not cur_tile.get_paint().is_ally():
-        if can_attack(my_loc):
+def try_paint_ground(my_loc):
+    # Endgame Frenzy
+    round_num = get_round_num()
+    force = False
+    
+    if round_num > 1750:
+        force = True
+    elif random.random() < 0.10: # 10% chance to paint empty tiles while exploring
+        force = True
+        
+    return smart_paint(my_loc, force_paint=force)
+
+# --- UTILS ---
+
+def smart_paint(my_loc, force_paint=False):
+    if not can_attack(my_loc): return False
+    
+    # 1. Check self
+    try:
+        my_tile = sense_map_info(my_loc)
+        if not my_tile.get_paint().is_ally():
             attack(my_loc)
-            return
-
-    # 6. Explore
-    navigate_randomly()
+            return True
+    except: pass
+        
+    nearby_8 = [my_loc.translate(dx, dy) for dx in (-1,0,1) for dy in (-1,0,1) if not (dx==0 and dy==0)]
+    random.shuffle(nearby_8) 
+    
+    for loc in nearby_8:
+        if can_attack(loc): 
+            try:
+                tile = sense_map_info(loc)
+                paint = tile.get_paint()
+                if paint.is_ally():
+                    continue
+                priority = 0
+                if paint.is_enemy():
+                    priority = 2
+                elif force_paint:
+                    priority = 1
+                if priority > 0:
+                    attack(loc)
+                    return True
+            except: pass 
+    return False
 
 def run_mopper():
+    # Priority: 1. Enemy Paint, 2. Empty Paint, 3. Move
     nearby = sense_nearby_map_infos()
+    # Shuffle to not get stuck
+    random.shuffle(nearby)
+    
+    # 1. Attack Enemy Paint
     for tile in nearby:
         if tile.get_paint().is_enemy() and can_attack(tile.get_map_location()):
              attack(tile.get_map_location())
              return
+
+    # 2. Attack Empty Paint (Expand)
+    for tile in nearby:
+        if tile.get_paint() == PaintType.EMPTY and can_attack(tile.get_map_location()):
+             attack(tile.get_map_location())
+             return
+             
     navigate_randomly()
 
 def run_splasher():
+    # Priority: 1. Enemy/Empty Paint (Area Effect), 2. Move
+    my_loc = get_location()
+    
+    if can_attack(my_loc):
+        # Scan 1-radius area (Splasher hits 9 tiles?)
+        # Actually Splasher attack is special. Let's just try to paint if we are not surrounded by allies.
+        # Simple heuristic: If standing on non-ally or near non-ally, attack.
+        if smart_paint(my_loc, force_paint=True):
+            return
+
     navigate_randomly()
 
-# --- Helpers ---
-
 def navigate_bounce(target_loc):
-    """
-    Stateless Tangent Bug / Bounce Logic
-    Try direct, then "bounce" around obstacles by checking side angles.
-    """
     if not target_loc: return
     my_loc = get_location()
     
@@ -273,10 +371,6 @@ def navigate_bounce(target_loc):
         move(d_desired)
         return
         
-    # Obstacle encountered!
-    # Try angles: +/- 45, +/- 90, +/- 135
-    
-    # Left side scan
     d_left = d_desired
     for _ in range(3):
         d_left = d_left.rotate_left()
@@ -284,7 +378,6 @@ def navigate_bounce(target_loc):
             move(d_left)
             return
             
-    # Right side scan
     d_right = d_desired
     for _ in range(3):
         d_right = d_right.rotate_right()
@@ -292,11 +385,12 @@ def navigate_bounce(target_loc):
             move(d_right)
             return
             
-    # If completely blocked, do nothing (wait) or random?
-    # Maybe random to unstuck
     navigate_randomly()
 
 def navigate_randomly():
-    if random.random() < 0.2: return
-    d = directions[random.randint(0, 7)]
-    if can_move(d): move(d)
+    choices = list(directions)
+    random.shuffle(choices)
+    for d in choices:
+        if can_move(d):
+            move(d)
+            return
