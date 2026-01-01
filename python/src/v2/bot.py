@@ -44,15 +44,17 @@ def run_tower():
     round_num = get_round_num()
     
     # Probabilities
+    # Default (Early Game)
     prob_soldier = 0.8
     prob_mopper = 0.1
-    # Splasher/Rest = Remainder
+    # Splasher = 0.1
     
     if round_num > 400:
-        # Mid/Late Game: Need more cleaning and AoE
-        prob_soldier = 0.5
-        prob_mopper = 0.3
-        # Splasher = 0.2
+        # Mid/Late Game
+        # FIX: Don't drop soldiers too low. We need them for map control (score).
+        prob_soldier = 0.7
+        prob_mopper = 0.2
+        # Splasher = 0.1
         
     spawn_dir = directions[random.randint(0, len(directions) - 1)]
     spawn_loc = get_location().add(spawn_dir)
@@ -71,14 +73,8 @@ def run_tower():
 def run_soldier():
     my_loc = get_location()
     
-    # 0. Process Communication to find claimed ruins
-    claimed_ruins = set()
-    # messages = read_messages(get_round_num())
-    # for m in messages:
-    #     val = m.get_bytes() 
-    #     if isinstance(val, int):
-    #         claimed_ruins.add(val)
-
+    # 0. Process Communication (Disabled)
+    
     # 1. Attack visible enemies
     nearby_enemies = sense_nearby_robots(team=get_team().opponent())
     if nearby_enemies:
@@ -90,50 +86,70 @@ def run_soldier():
             navigate_to(target.get_location())
             return
     
-    # 2. Economy: Check for Resource Pattern spots (SRP)
-    # Check 8 neighbors + center for potential SRP center
-    # This is expensive? No, 9 checks.
+    # 2. Economy: Resource Patterns (SRP)
+    # FIX: Prioritize completing existing patterns before starting new ones.
     nearby_map_infos = sense_nearby_map_infos()
-    width = get_map_width()
     
-    best_srp_loc = None
-    for dx in range(-2, 3):
-        for dy in range(-2, 3):
-            # We are scanning for a place to put the CENTER of the SRP
-            check_loc = my_loc.translate(dx, dy)
-            if can_mark_resource_pattern(check_loc):
-                best_srp_loc = check_loc
-                break
-        if best_srp_loc: break
-        
-    if best_srp_loc:
-        mark_resource_pattern(best_srp_loc)
-        log("Marked SRP at " + str(best_srp_loc))
+    # Check if we are near a pending SRP (marked but not complete)
+    # We look for tiles with markers that need painting.
+    # Actually, let's scan for a valid SRP center that is MARKED.
+    # We can't directly "sense SRPs", but we can sense markers.
+    
+    # Simple Logic: If we see a spot allowing `complete_resource_pattern`, we do it.
+    if can_complete_resource_pattern(my_loc):
+        complete_resource_pattern(my_loc)
+        log("Completed SRP!")
         return
+        
+    # Check neighbors for completion
+    for dir in directions:
+        check_loc = my_loc.add(dir)
+        if can_complete_resource_pattern(check_loc):
+            complete_resource_pattern(check_loc)
+            log("Completed SRP nearby!")
+            return
 
-    # Check if we are working on an SRP (painting it)
-    # SRP marking is global? Or marker based?
-    # can_complete_resource_pattern(loc) checks if it's ready
-    # We need to paint if marked.
-    # Scan nearby tiles for markers consistent with SRP?
-    # The API might simplify this. If `mark_resource_pattern` places markers, 
-    # then subsequent turns we just see markers and paint.
-    # So we just need generic "Paint Markers" logic, which we have for towers.
-    # It should be covered by generic paint logic below or specific painting loop.
+    # Scan for opportunities to paint SRPs
+    # If we find a tile with a marker, treat it as a high priority "Project"
+    srp_project_loc = None
+    for tile in nearby_map_infos:
+        if tile.get_map_location().distance_squared_to(my_loc) <= 8:
+            mark = tile.get_mark()
+            paint = tile.get_paint()
+            # If marked and not painted, it's a project (SRP or Tower)
+            if mark != PaintType.EMPTY and mark != paint:
+                # Check if it's an SRP marker? 
+                # Diff between SRP and Tower marker is subtle (just colors).
+                # But we should help build it anyway.
+                srp_project_loc = tile.get_map_location()
+                break
+    
+    if srp_project_loc:
+        # We found a project! Contribute to it.
+        if can_attack(srp_project_loc):
+             # Determine needed color
+             target_tile = sense_map_info(srp_project_loc)
+             use_secondary = (target_tile.get_mark() == PaintType.ALLY_SECONDARY)
+             attack(srp_project_loc, use_secondary)
+             return
+        else:
+            navigate_to(srp_project_loc)
+            return
 
+    # If no active projects, consider Starting a new SRP
+    # Only if we aren't near a ruin we should be building?
+    # Ruins are higher priority than new SRPs usually. 
+    # Let's move this AFTER ruin logic.
+    pass # Fall through
+    
     # 3. Building Towers on Ruins
     closest_ruin = None
     min_dist = 99999
+    width = get_map_width()
     
     for info in nearby_map_infos:
         if info.has_ruin():
             loc = info.get_map_location()
-            
-            # Check if claimed by message
-            loc_id = loc.x + loc.y * width
-            if loc_id in claimed_ruins:
-                continue
-                
             robot_on_ruin = sense_robot_at_location(loc)
             if robot_on_ruin and robot_on_ruin.get_team() == get_team() and robot_on_ruin.get_type().is_tower_type():
                 continue
@@ -147,12 +163,8 @@ def run_soldier():
         ruin_loc = closest_ruin.get_map_location()
         dist = min_dist
         
-        # Broadcast claim
-        # Scream it to the world!
-        loc_id = ruin_loc.x + ruin_loc.y * width
-        # if can_broadcast_message():
-        #     broadcast_message(loc_id)
-        
+        # Broadcast (Disabled)
+
         if dist <= 2: 
             tower_type = UnitType.LEVEL_ONE_PAINT_TOWER
             
@@ -164,45 +176,36 @@ def run_soldier():
                 log("Completed Tower!")
                 return
             
-            # Paint the pattern (Generic for Tower or SRP)
-            # Both leave markers.
-            painted_something = False
-            for tile in nearby_map_infos:
-                if tile.get_map_location().distance_squared_to(ruin_loc) <= 8:
-                    mark = tile.get_mark()
-                    paint = tile.get_paint()
-                    if mark != PaintType.EMPTY and mark != paint:
-                        use_secondary = (mark == PaintType.ALLY_SECONDARY)
-                        if can_attack(tile.get_map_location()):
-                            attack(tile.get_map_location(), use_secondary)
-                            painted_something = True
-                            break 
-            
-            if painted_something:
-                return
+            # Use generic painter loop below
+            pass
 
         else:
             navigate_to(ruin_loc)
             return
 
-    # 4. Generic Painting (Expansion + Completing patterns found on ground)
-    # Check current tile and neighbors for Markers that need painting
-    # This covers SRPs marked by us or others
-    for tile in nearby_map_infos:
-         # Only check very close tiles we can paint
-         if tile.get_map_location().distance_squared_to(my_loc) <= 2:
-             mark = tile.get_mark()
-             paint = tile.get_paint()
-             if mark != PaintType.EMPTY and mark != paint:
-                  use_secondary = (mark == PaintType.ALLY_SECONDARY)
-                  if can_attack(tile.get_map_location()):
-                        attack(tile.get_map_location(), use_secondary)
-                        return
+    # 3b. Start new SRP (If no Ruin and no Active Project)
+    # Only if safe?
+    best_srp_loc = None
+    for dx in range(-2, 3):
+        for dy in range(-2, 3):
+            check_loc = my_loc.translate(dx, dy)
+            if can_mark_resource_pattern(check_loc):
+                best_srp_loc = check_loc
+                break
+        if best_srp_loc: break
+        
+    if best_srp_loc:
+        mark_resource_pattern(best_srp_loc)
+        log("Started new SRP at " + str(best_srp_loc))
+        return
 
+    # 4. Generic Painting (Projects found above or generic expansion)
+    # We already handled "Project" painting in 2.
+    # So this is just fallback for things we missed or expansion.
+    
     # 5. Paint the ground (Expansion)
     cur_tile = sense_map_info(my_loc)
     cur_paint = cur_tile.get_paint()
-    
     if not cur_paint.is_ally():
         if can_attack(my_loc):
             attack(my_loc)
